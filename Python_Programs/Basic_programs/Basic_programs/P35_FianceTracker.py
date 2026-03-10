@@ -32,6 +32,7 @@ class FinanceDB:
             return cursor.fetchall() if fetch else cursor.lastrowid
 
     def create_tables(self):
+        # Users Table
         self.query("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,6 +43,7 @@ class FinanceDB:
             )
         """, commit=True)
 
+        # Transactions Table
         self.query("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +57,7 @@ class FinanceDB:
             )
         """, commit=True)
 
+        # Budgets Table
         self.query("""
             CREATE TABLE IF NOT EXISTS budgets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +65,19 @@ class FinanceDB:
                 category TEXT,
                 monthly_limit REAL CHECK(monthly_limit>=0),
                 UNIQUE(user_id, category),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """, commit=True)
+
+        # Goals Table
+        self.query("""
+            CREATE TABLE IF NOT EXISTS goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                goal_name TEXT,
+                target_amount REAL CHECK(target_amount>0),
+                current_saved REAL DEFAULT 0,
+                UNIQUE(user_id, goal_name),
                 FOREIGN KEY (user_id) REFERENCES users(id)
             )
         """, commit=True)
@@ -87,6 +103,13 @@ def get_input(prompt, required=True):
         print(Fore.RED + "⚠ Field cannot be empty.")
         return get_input(prompt, required)
     return val
+
+def get_available_balance(user_id):
+    """Calculates balance minus what is already committed to goals."""
+    income = db.query("SELECT SUM(amount) FROM transactions WHERE user_id=? AND type=?", (user_id, INCOME), fetch=True)[0][0] or 0
+    expense = db.query("SELECT SUM(amount) FROM transactions WHERE user_id=? AND type=?", (user_id, EXPENSE), fetch=True)[0][0] or 0
+    locked_in_goals = db.query("SELECT SUM(current_saved) FROM goals WHERE user_id=?", (user_id,), fetch=True)[0][0] or 0
+    return income - expense - locked_in_goals
 
 # -----------------------------
 # Auth & Recovery
@@ -156,6 +179,73 @@ def recover_password():
     input("Press Enter...")
 
 # -----------------------------
+# Savings Goal Logic
+# -----------------------------
+
+def manage_goals(user_id):
+    while True:
+        clear_screen()
+        print(Fore.CYAN + "=== SAVINGS GOALS ===")
+        goals = db.query("SELECT goal_name, target_amount, current_saved FROM goals WHERE user_id=?", (user_id,), fetch=True)
+        
+        if not goals:
+            print("No goals set yet.")
+        else:
+            for name, target, saved in goals:
+                perc = min((saved / target) * 100, 100)
+                bar_len = 20
+                filled = int((perc/100) * bar_len)
+                bar = "█" * filled + "-" * (bar_len - filled)
+                print(f"\nGoal: {Fore.YELLOW}{name}")
+                print(f"Progress: |{bar}| {perc:.1f}% (${saved:,.2f} / ${target:,.2f})")
+
+        print("\n1) New Goal  2) Transfer to Goal  3) Withdraw from Goal  4) Delete Goal  5) Back")
+        choice = input("\nChoice: ")
+        
+        if choice == "1":
+            name = get_input("Goal Name: ").title()
+            try:
+                target = float(get_input("Target Amount: "))
+                db.query("INSERT INTO goals (user_id, goal_name, target_amount) VALUES (?,?,?)", (user_id, name, target), commit=True)
+                print(Fore.GREEN + "Goal Created!")
+            except: print(Fore.RED + "Invalid amount.")
+            
+        elif choice == "2":
+            available = get_available_balance(user_id)
+            print(f"\nAvailable to Transfer: {Fore.GREEN}${available:,.2f}")
+            g_name = get_input("Goal Name: ").title()
+            try:
+                amt = float(get_input("Amount to save: "))
+                if amt <= available:
+                    db.query("UPDATE goals SET current_saved = current_saved + ? WHERE user_id=? AND goal_name=?", (amt, user_id, g_name), commit=True)
+                    print(Fore.GREEN + "Transfer successful!")
+                else: print(Fore.RED + "Insufficient balance.")
+            except: print(Fore.RED + "Error processing transfer.")
+            
+        elif choice == "3":
+            g_name = get_input("Goal Name: ").title()
+            res = db.query("SELECT current_saved FROM goals WHERE user_id=? AND goal_name=?", (user_id, g_name), fetch=True)
+            if res:
+                saved = res[0][0]
+                print(f"Currently saved in {g_name}: {Fore.YELLOW}${saved:,.2f}")
+                try:
+                    amt = float(get_input("Amount to withdraw: "))
+                    if amt <= saved:
+                        db.query("UPDATE goals SET current_saved = current_saved - ? WHERE user_id=? AND goal_name=?", (amt, user_id, g_name), commit=True)
+                        print(Fore.GREEN + f"${amt} moved back to Main Balance.")
+                    else: print(Fore.RED + "Cannot withdraw more than saved.")
+                except: print(Fore.RED + "Invalid input.")
+            else: print(Fore.RED + "Goal not found.")
+
+        elif choice == "4":
+            g_name = get_input("Goal Name to Delete: ").title()
+            db.query("DELETE FROM goals WHERE user_id=? AND goal_name=?", (user_id, g_name), commit=True)
+            print(Fore.YELLOW + "Goal deleted.")
+
+        elif choice == "5": break
+        input("\nPress Enter...")
+
+# -----------------------------
 # Finance Logic
 # -----------------------------
 
@@ -199,19 +289,20 @@ def check_budget(user_id, category):
             print(Fore.YELLOW + "⚠ Over 80% used.")
 
 def view_total_balance(user_id):
-    """Calculates Net Balance = Total Income - Total Expense"""
     total_income = db.query("SELECT SUM(amount) FROM transactions WHERE user_id=? AND type=?", (user_id, INCOME), fetch=True)[0][0] or 0
     total_expense = db.query("SELECT SUM(amount) FROM transactions WHERE user_id=? AND type=?", (user_id, EXPENSE), fetch=True)[0][0] or 0
+    goal_savings = db.query("SELECT SUM(current_saved) FROM goals WHERE user_id=?", (user_id,), fetch=True)[0][0] or 0
     
-    balance = total_income - total_expense
+    available = total_income - total_expense - goal_savings
     
     print(f"\n{Fore.CYAN}--- Financial Snapshot ---")
-    print(f"Total Income  : {Fore.GREEN}{total_income:,.2f}")
-    print(f"Total Expense : {Fore.RED}{total_expense:,.2f}")
-    print("-" * 25)
+    print(f"Total Income      : {Fore.GREEN}{total_income:,.2f}")
+    print(f"Total Expense     : {Fore.RED}{total_expense:,.2f}")
+    print(f"Locked in Goals   : {Fore.YELLOW}{goal_savings:,.2f}")
+    print("-" * 35)
     
-    balance_color = Fore.GREEN if balance >= 0 else Fore.RED
-    print(f"Net Balance   : {balance_color}{balance:,.2f}")
+    balance_color = Fore.GREEN if available >= 0 else Fore.RED
+    print(f"Available Balance : {balance_color}{available:,.2f}")
     input("\nPress Enter to return...")
 
 def view_all_transactions(user_id):
@@ -251,17 +342,19 @@ def user_menu(user_id):
         print("1) Add Income")
         print("2) Add Expense")
         print("3) View History")
-        print("4) Set Budget")
-        print("5) Monthly Summary")
-        print("6) Total Balance")
-        print("7) Logout")
+        print("4) Savings Goals (New)")
+        print("5) Set Budget")
+        print("6) Monthly Summary")
+        print("7) Total Balance")
+        print("8) Logout")
         
         choice = input("\nChoice: ")
         
         if choice == "1": add_transaction(user_id, INCOME)
         elif choice == "2": add_transaction(user_id, EXPENSE)
         elif choice == "3": view_all_transactions(user_id)
-        elif choice == "4":
+        elif choice == "4": manage_goals(user_id)
+        elif choice == "5":
             cat = get_input("Category: ").title()
             try:
                 limit = float(get_input("Monthly Limit: "))
@@ -271,9 +364,9 @@ def user_menu(user_id):
             except ValueError:
                 print(Fore.RED + "Invalid number.")
             input("Press Enter...")
-        elif choice == "5": monthly_report(user_id)
-        elif choice == "6": view_total_balance(user_id)
-        elif choice == "7": break
+        elif choice == "6": monthly_report(user_id)
+        elif choice == "7": view_total_balance(user_id)
+        elif choice == "8": break
 
 def main():
     while True:
